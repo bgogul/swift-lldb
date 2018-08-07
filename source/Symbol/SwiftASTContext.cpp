@@ -194,9 +194,250 @@ llvm::LLVMContext &SwiftASTContext::GetGlobalLLVMContext() {
   return s_global_context;
 }
 
-llvm::ArrayRef<swift::VarDecl *> SwiftASTContext::GetStoredProperties(
-                                             swift::NominalTypeDecl *nominal) {
-  VALID_OR_RETURN(llvm::ArrayRef<swift::VarDecl *>());
+CachedMemberInfo *SwiftASTContext::GetCachedMemberInfo(void *type) {
+  VALID_OR_RETURN(nullptr);
+
+  if (type) {
+    // printf("CompilerType::GetCachedMemberInfo () for %s...",
+    // GetTypeName().c_str());
+    bool is_class = false;
+    bool is_protocol = false;
+    MemberInfoCache *member_info_cache = GetMemberInfoCache(GetASTContext());
+    MemberInfoCache::const_iterator pos = member_info_cache->find(type);
+    if (pos != member_info_cache->end()) {
+      // printf("cached: %p\n", pos->second.get());
+      return pos->second.get();
+    }
+
+    CachedMemberInfoSP member_infos_sp(new CachedMemberInfo());
+    // printf("creating in %p\n", member_infos_sp.get());
+
+    swift::CanType swift_can_type(GetCanonicalSwiftType(type));
+
+    std::vector<const swift::irgen::TypeInfo *> field_type_infos;
+    swift::irgen::LayoutStrategy layout_strategy =
+        swift::irgen::LayoutStrategy::Optimal;
+
+    const swift::TypeKind type_kind = swift_can_type->getKind();
+    switch (type_kind) {
+    case swift::TypeKind::Error:
+    case swift::TypeKind::BuiltinInteger:
+    case swift::TypeKind::BuiltinFloat:
+    case swift::TypeKind::BuiltinRawPointer:
+    case swift::TypeKind::BuiltinBridgeObject:
+    case swift::TypeKind::BuiltinNativeObject:
+    case swift::TypeKind::BuiltinUnsafeValueBuffer:
+    case swift::TypeKind::BuiltinUnknownObject:
+    case swift::TypeKind::BuiltinVector:
+    case swift::TypeKind::NameAlias:
+    case swift::TypeKind::Paren:
+    case swift::TypeKind::UnownedStorage:
+    case swift::TypeKind::WeakStorage:
+    case swift::TypeKind::UnmanagedStorage:
+    case swift::TypeKind::GenericTypeParam:
+    case swift::TypeKind::DependentMember:
+    case swift::TypeKind::Optional:
+    case swift::TypeKind::ImplicitlyUnwrappedOptional:
+    case swift::TypeKind::Metatype:
+    case swift::TypeKind::Module:
+    case swift::TypeKind::Function:
+    case swift::TypeKind::GenericFunction:
+    case swift::TypeKind::ArraySlice:
+    case swift::TypeKind::LValue:
+    case swift::TypeKind::UnboundGeneric:
+    case swift::TypeKind::Enum:
+    case swift::TypeKind::BoundGenericEnum:
+    case swift::TypeKind::ExistentialMetatype:
+    case swift::TypeKind::DynamicSelf:
+    case swift::TypeKind::SILBox:
+    case swift::TypeKind::SILFunction:
+    case swift::TypeKind::SILBlockStorage:
+    case swift::TypeKind::InOut:
+    case swift::TypeKind::Unresolved:
+      assert(false &&
+             "Caller must only call this function with valid type_kind");
+      break;
+
+    case swift::TypeKind::Tuple: {
+      layout_strategy = swift::irgen::LayoutStrategy::Universal;
+
+      swift::TupleType *tuple_type = swift_can_type->getAs<swift::TupleType>();
+      for (auto tuple_field : tuple_type->getElements()) {
+        MemberInfo member_info(MemberType::Field);
+        member_info.clang_type =
+            CompilerType(GetASTContext(), tuple_field.getType().getPointer());
+        member_info.byte_size = member_info.clang_type.GetByteSize(nullptr);
+
+        const char *tuple_name = tuple_field.getName().get();
+        if (tuple_name) {
+          member_info.name.SetCString(tuple_name);
+        } else {
+          StreamString tuple_name_strm;
+          tuple_name_strm.Printf(
+              "%u", (uint32_t)member_infos_sp->member_infos.size());
+          member_info.name.SetCString(tuple_name_strm.GetString().c_str());
+        }
+
+        field_type_infos.push_back(
+            GetSwiftTypeInfo(member_info.clang_type.GetOpaqueQualType()));
+        assert(field_type_infos.back() != nullptr);
+        member_infos_sp->member_infos.push_back(member_info);
+      }
+    } break;
+
+    case swift::TypeKind::Protocol:
+    case swift::TypeKind::ProtocolComposition: {
+      ProtocolInfo protocol_info;
+      if (!GetProtocolTypeInfo(
+              CompilerType(GetASTContext(), GetSwiftType(type)), protocol_info))
+        break;
+      is_protocol = true;
+      uint32_t num_children = protocol_info.m_num_storage_words;
+      if (protocol_info.IsOneWordStorage())
+        protocol_info.m_num_protocols = 0;
+
+      for (uint32_t idx = 0; idx < num_children; idx++) {
+        MemberInfo member_info(MemberType::Field);
+        member_info.clang_type = CompilerType(
+            GetASTContext(), GetASTContext()->TheRawPointerType.getPointer());
+        member_info.byte_size = member_info.clang_type.GetByteSize(nullptr);
+        member_info.byte_offset = idx * member_info.byte_size;
+        member_info.is_fragile = false;
+        StreamString child_name_stream;
+        if (protocol_info.IsOneWordStorage())
+          child_name_stream.Printf("instance_type");
+        else {
+          if (idx < protocol_info.m_num_payload_words)
+            child_name_stream.Printf("payload_data_%u", idx);
+          else {
+            int l_idx = idx - protocol_info.m_num_payload_words;
+            if (l_idx == 0)
+              child_name_stream.Printf("instance_type");
+            else
+              child_name_stream.Printf("protocol_witness_%u", l_idx - 1);
+          }
+        }
+        member_info.name = ConstString(child_name_stream.GetData());
+        member_infos_sp->member_infos.push_back(member_info);
+      }
+    } break;
+
+    case swift::TypeKind::Struct:
+    case swift::TypeKind::Class: {
+      swift::ClassDecl *class_decl =
+          swift_can_type->getClassOrBoundGenericClass();
+      swift::NominalType *nominal_type =
+          swift_can_type->getAs<swift::NominalType>();
+      if (nominal_type) {
+        swift::NominalTypeDecl *nominal_decl = nominal_type->getDecl();
+        if (nominal_decl) {
+          if (class_decl) {
+            is_class = true;
+            swift::Type superclass_type(class_decl->getSuperclass());
+            if (superclass_type) {
+              MemberInfo member_info(MemberType::BaseClass);
+              member_info.clang_type =
+                  CompilerType(GetASTContext(), superclass_type.getPointer());
+              member_info.byte_size =
+                  member_info.clang_type.GetByteSize(nullptr);
+              member_info.is_fragile = false;
+              member_info.name.SetCString(
+                  member_info.clang_type.GetTypeName().AsCString(
+                      "<no type name>"));
+              field_type_infos.push_back(
+                  GetSwiftTypeInfo(member_info.clang_type.GetOpaqueQualType()));
+              assert(field_type_infos.back() != nullptr);
+              member_infos_sp->member_infos.push_back(member_info);
+            }
+          }
+
+          for (auto decl : nominal_decl->getMembers()) {
+            if (swift::isa<swift::VarDecl>(decl)) {
+              swift::VarDecl *var_decl = llvm::cast<swift::VarDecl>(decl);
+              if (var_decl->hasStorage() && !var_decl->isStatic()) {
+                MemberInfo member_info(MemberType::Field);
+                member_info.clang_type = CompilerType(
+                    GetASTContext(), var_decl->getInterfaceType().getPointer());
+                member_info.byte_size =
+                    member_info.clang_type.GetByteSize(nullptr);
+                member_info.is_fragile =
+                    is_class; // Class fields are all fragile...
+                const char *child_name_cstr = var_decl->getName().get();
+                if (child_name_cstr)
+                  member_info.name.SetCString(child_name_cstr);
+                field_type_infos.push_back(
+                    GetSwiftTypeInfo(nominal_type, var_decl));
+                assert(field_type_infos.back() != nullptr);
+                member_infos_sp->member_infos.push_back(member_info);
+              }
+            }
+          }
+        }
+      }
+    } break;
+
+    case swift::TypeKind::BoundGenericStruct:
+    case swift::TypeKind::BoundGenericClass: {
+      swift::ClassDecl *class_decl =
+          swift_can_type->getClassOrBoundGenericClass();
+      swift::BoundGenericType *t =
+          swift_can_type->getAs<swift::BoundGenericType>();
+      if (t) {
+        swift::NominalTypeDecl *t_decl = t->getDecl();
+        if (t_decl) {
+          if (class_decl) {
+            is_class = true;
+            swift::LazyResolver *const lazy_resolver = nullptr;
+            swift::Type superclass_type(t->getSuperclass(lazy_resolver));
+            if (superclass_type) {
+              MemberInfo member_info(MemberType::BaseClass);
+              member_info.clang_type =
+                  CompilerType(GetASTContext(), superclass_type.getPointer());
+              member_info.byte_size =
+                  member_info.clang_type.GetByteSize(nullptr);
+              // Showing somemodule.sometype<A> is confusing to the user because
+              // it will show the *unboud* archetype name even though the type
+              // is actually properly bound (or it should!) and since one cannot
+              // overload a class on the number of generic arguments,
+              // somemodule.sometype is just as unique.
+              member_info.name.SetCString(
+                  member_info.clang_type.GetUnboundType()
+                      .GetTypeName()
+                      .AsCString("<no type name>"));
+              field_type_infos.push_back(
+                  GetSwiftTypeInfo(member_info.clang_type.GetOpaqueQualType()));
+              assert(field_type_infos.back() != nullptr);
+              member_infos_sp->member_infos.push_back(member_info);
+            }
+          }
+
+          for (auto decl : t_decl->getMembers()) {
+            // Find ivars that aren't properties
+            if (swift::isa<swift::VarDecl>(decl)) {
+              swift::VarDecl *var_decl = llvm::cast<swift::VarDecl>(decl);
+              if (var_decl->hasStorage() && !var_decl->isStatic()) {
+                MemberInfo member_info(MemberType::Field);
+                swift::Type member_type = swift_can_type->getTypeOfMember(
+                    t_decl->getModuleContext(), var_decl);
+                member_info.clang_type =
+                    CompilerType(GetASTContext(), member_type.getPointer());
+                member_info.byte_size =
+                    member_info.clang_type.GetByteSize(nullptr);
+                member_info.is_fragile =
+                    is_class; // Class fields are all fragile...
+                const char *child_name_cstr = var_decl->getName().get();
+                if (child_name_cstr)
+                  member_info.name.SetCString(child_name_cstr);
+                field_type_infos.push_back(GetSwiftTypeInfo(
+                    member_info.clang_type.GetOpaqueQualType()));
+                assert(field_type_infos.back() != nullptr);
+                member_infos_sp->member_infos.push_back(member_info);
+              }
+            }
+          }
+        }
+      }
+    } break;
 
   // Check whether we already have the stored properties for this
   // nominal type.
@@ -522,7 +763,7 @@ public:
       swift::EnumElementDecl *case_decl = enum_case.decl;
       assert(case_decl);
       CompilerType case_type(
-          ast, swift_can_type->getTypeOfMember(module_ctx, case_decl, nullptr)
+          ast, swift_can_type->getTypeOfMember(module_ctx, case_decl)
                    .getPointer());
       case_type = GetFunctionArgumentTuple(case_type.GetFunctionReturnType());
 
