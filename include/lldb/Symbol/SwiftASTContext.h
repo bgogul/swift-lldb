@@ -215,7 +215,7 @@ public:
   }
 
   // SWIFT_ENABLE_TENSORFLOW
-  bool UseSerialization() { return getenv("LLDB_USE_SERIALIZATION"); }
+  bool UseSerialization() { return !getenv("LLDB_DONT_USE_SERIALIZATION"); }
 
   // SWIFT_ENABLE_TENSORFLOW
   // Returns true if successful, false otherwise.
