@@ -421,7 +421,8 @@ public:
 
 protected:
   Log *m_log;
-  swift::SourceFile &m_source_file;
+  //swift::SourceFile &m_source_file;
+  swift::FileUnit &m_source_file;
   SwiftExpressionParser::SILVariableMap &m_variable_map;
   SymbolContext m_sc;
   SwiftPersistentExpressionState *m_persistent_vars = nullptr;
@@ -908,7 +909,7 @@ static void CountLocals(
 
       const ConstString &name(variable_sp->GetUnqualifiedName());
       const char *name_cstring = variable_sp->GetUnqualifiedName().GetCString();
-
+      llvm::dbgs() << "Adding local variable " << name_cstring << "\n";
       if (name.IsEmpty())
         continue;
 
@@ -1781,6 +1782,10 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
     log->PutCString(s.c_str());
   }
 
+  // SWIFT_ENABLE_TENSORFLOW
+  llvm::DenseMap<swift::ValueDecl *, lldb::ExpressionVariableSP>
+      decl_persistent_var_map;
+
   // Allow variables to be re-used from previous REPL statements.
   if (m_sc.target_sp && (repl || !playground)) {
     Status error;
@@ -1838,6 +1843,7 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
               new VariableMetadataPersistent(persistent_variable));
 
           persistent_state->RegisterSwiftPersistentDecl(decl);
+          decl_persistent_var_map[decl] = persistent_variable;
         }
       }
 
@@ -1966,7 +1972,10 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
           done_serialization = true;
         });
   } else {
-    sil_module->setSerializeSILAction([] {});
+    sil_module->setSerializeSILAction([&sil_module] {
+      llvm::dbgs() << "After diag passes";
+      sil_module->print(llvm::dbgs(), true);
+    });
   }
 
   runSILDiagnosticPasses(*sil_module);
@@ -2061,6 +2070,9 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
     if (log) {
       log->Printf("Reloading the serialized module.\n");
     }
+    llvm::dbgs() << "Old module " ;
+    parsed_expr->module.dump(llvm::dbgs());
+
 
     lldb::StackFrameSP this_frame_sp(m_stack_frame_wp.lock());
 
@@ -2081,19 +2093,166 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
       return 1;
     }
 
+    llvm::dbgs() << "New module " ;
+    module->dump(llvm::dbgs());
     // Update persistent non-variable decls to the ones in the serialized module.
     // Otherwise, we will have deserialization errors.
     auto *persistent_state =
         m_sc.target_sp->GetSwiftPersistentExpressionState(*m_exe_scope);
     llvm::SmallVector<swift::Decl*, 8> decls;
     module->getTopLevelDecls(decls);
-    for (swift::Decl *decl : decls) {
-      if (swift::ValueDecl *value_decl = llvm::dyn_cast<swift::ValueDecl>(decl)) {
-        if (!llvm::isa<swift::VarDecl>(value_decl) && value_decl->hasName()) {
+    SwiftASTContext* scratch_ast_context = m_swift_ast_context->get();
+    if (scratch_ast_context) {
+      for (swift::Decl *decl : decls) {
+        swift::ValueDecl *value_decl = llvm::dyn_cast<swift::ValueDecl>(decl);
+        if (value_decl == nullptr) continue;
+        if (!value_decl->hasName()) continue;
+        if (!llvm::isa<swift::VarDecl>(value_decl)) {
           persistent_state->RegisterSwiftPersistentDecl(value_decl);
+          continue;
+        }
+        swift::VarDecl *var_decl = llvm::dyn_cast<swift::VarDecl>(decl);
+        assert(var_decl);
+        // Skip special vars that should not be registered into persistent state.
+        llvm::StringRef var_name = var_decl->getName().str();
+        if (var_name.startswith("$")) continue;
+        llvm::dbgs() << "Examining var decl: "  << var_decl->getName().str() << "\n";
+        std::vector<swift::ValueDecl *> matches;
+        ConstString var_name_cs(var_name);
+        if (persistent_state->GetSwiftPersistentDecls(var_name_cs, {}, matches)) {
+          llvm::dbgs() << "Re-registering var decl: "  << var_decl->getName().str() << "\n";
+          assert(matches.size() == 1 && "More than one var decl found!");
+          swift::ValueDecl *matched_decl = matches.front();
+          lldb::ExpressionVariableSP persistent_var = decl_persistent_var_map.lookup(matched_decl);
+          assert(persistent_var && "Persistent variable not found for a decl");
+          llvm::dbgs() << "Old Decl: ";
+          matched_decl->print(llvm::dbgs());
+          llvm::dbgs() << "\n";
+          llvm::dbgs() << "New Decl: ";
+          var_decl->print(llvm::dbgs());
+          llvm::dbgs() << "\n";
+          // std::string new_var_name;
+          // GetNameFromModule(&parsed_expr->module, new_var_name);
+          // new_var_name += ".";
+          // new_var_name += var_name.str();
+          // persistent_var->SetName(ConstString(new_var_name));
+          // variable_map[persistent_var->GetName().GetCString()] =
+          //     variable_map[var_name_cs.GetCString()];
+          // Update the type for the persistent var and register our new decl.
+          auto type = var_decl->getDeclContext()->mapTypeIntoContext(
+              var_decl->getInterfaceType());
+          CompilerType var_ctype(&var_decl->getASTContext(), type.getPointer());
+          CompilerType imported_type =
+              ImportType(*scratch_ast_context, var_ctype);
+          assert(imported_type);
+          persistent_var->SetCompilerType(imported_type);
+          persistent_state->RegisterSwiftPersistentDecl(var_decl);
+          var_decl->setREPLVar(true);
         }
       }
     }
+  //   //-----
+  //   // Patch up the decls in the persistent state for variables
+  //   SwiftASTContext *scratch_ast_context = m_swift_ast_context->get();
+  //   if (scratch_ast_context) {
+
+  //     llvm::SmallVector<size_t, 1> declaration_indexes;
+  //     parsed_expr->code_manipulator->FindVariableDeclarations(
+  //         declaration_indexes, repl);
+
+  //     for (size_t declaration_index : declaration_indexes) {
+  //       SwiftASTManipulator::VariableInfo &variable_info =
+  //           parsed_expr->code_manipulator->GetVariableInfo()[declaration_index];
+  //       ConstString name(variable_info->GetName().str());
+  //       std::vector<swift::ValueDecl *> matches;
+  //       if (persistent_state->GetSwiftPersistentDecls(name, {}, matches)) {
+  //         assert(matches.size() == 1 && "More than one var decl found!");
+  //         swift::ValueDecl* matched_decl = *matches.front();
+  //         auto type = var_decl->getDeclContext()->mapTypeIntoContext(
+  //             var_decl->getInterfaceType());
+  //         CompilerType var_ctype(&var_decl->getASTContext(), type.getPointer());
+  //         CompilerType imported_type =
+  //             ImportType(*scratch_ast_context, decl->GetType());
+  //         assert(imported_type);
+  //         persistent_var->SetCompilerType(imported_type);
+  //         auto type = var_decl->getDeclContext()->mapTypeIntoContext(
+  //             var_decl->getInterfaceType());
+  //         persistent_info.m_name = name;
+  //         persistent_info.m_type = CompilerType(&var_decl->getASTContext(),
+  //                                               type.getPointer());
+  //         persistent_info.m_decl = var_decl;
+
+  //   m_variables.push_back(persistent_info);
+
+  //   found_declarations.push_back(persistent_info_location);
+  // };
+          
+  //       }
+  //     }
+  //   }
+
+    // for (swift::Decl *decl : decls) {
+    //   swift::VarDecl *var_decl = llvm::dyn_cast<swift::VarDecl>(decl);
+    //   if (var_decl == nullptr) continue;
+    //   llvm::dbgs() << "Re-registering var decl: "  << var_decl->getName().str() << "\n";
+    //   CompilerType imported_type = ImportType(
+    //       *swift_ast_ctx,
+    //       CompilerType(swift_ast_ctx->GetASTContext(), var_decl->getType()));
+
+    //   // ConstString name_cs = ConstString(var_decl->getName().str());
+    //   // lldb::ExpressionVariableSP expr_var_sp =
+    //   //     persistent_state->GetVariable(name_cs);
+    //   // SwiftASTManipulatorBase::VariableMetadataSP metadata_sp(
+    //   //     new VariableMetadataPersistent(expr_var_sp));
+
+    //   // SwiftASTManipulator::VariableInfo variable_info(
+    //   //     imported_type,
+    //   //     var_decl->getName(),
+    //   //     metadata_sp,
+    //   //     /*TODO*/swift::VarDecl::Specifier::Var);
+    //   if (!imported_type) continue; // TODO:
+    //   // SwiftASTManipulator::VariableInfo variable_info =
+    //   //       parsed_expr->code_manipulator->GetVariableInfo()[declaration_index];
+
+    //   //   CompilerType imported_type =
+    //   //       ImportType(*scratch_ast_context, variable_info.GetType());
+
+    //   lldb::ExpressionVariableSP persistent_variable =
+    //       persistent_state->AddNewlyConstructedVariable(
+    //           new SwiftExpressionVariable(
+    //               m_sc.target_sp.get(),
+    //               ConstString(var_decl->getName().str()), imported_type,
+    //               m_sc.target_sp->GetArchitecture().GetByteOrder(),
+    //               m_sc.target_sp->GetArchitecture().GetAddressByteSize()));
+
+    //   if (repl) {
+    //     persistent_variable->m_flags |= ExpressionVariable::EVKeepInTarget;
+    //     persistent_variable->m_flags |=
+    //         ExpressionVariable::EVIsProgramReference;
+    //   } else {
+    //     persistent_variable->m_flags |=
+    //         ExpressionVariable::EVNeedsAllocation;
+    //     persistent_variable->m_flags |= ExpressionVariable::EVKeepInTarget;
+    //     llvm::cast<SwiftExpressionVariable>(persistent_variable.get())
+    //         ->m_swift_flags |= SwiftExpressionVariable::EVSNeedsInit;
+    //   }
+
+    //   if (var_decl->isLet()) {
+    //     llvm::cast<SwiftExpressionVariable>(persistent_variable.get())
+    //         ->SetIsModifiable(false);
+    //   }
+    //   if (!var_decl->hasStorage()) {
+    //     llvm::cast<SwiftExpressionVariable>(persistent_variable.get())
+    //         ->SetIsComputed(true);
+    //   }
+
+    //   //     variable_info.m_metadata.reset(
+    //   //         new VariableMetadataPersistent(persistent_variable));
+
+    //   persistent_state->RegisterSwiftPersistentDecl(var_decl);
+    //   llvm::dbgs() << "Done\n";
+    // }
+    //------------------------
   }
   parsed_expr->ast_context.LoadedModules.insert({module->getName(), module});
   swift_ast_ctx->CacheModule(module);

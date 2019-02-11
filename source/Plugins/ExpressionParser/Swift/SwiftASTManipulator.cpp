@@ -833,6 +833,7 @@ void SwiftASTManipulator::FindVariableDeclarations(
     for (swift::Decl *decl : m_source_file.Decls) {
       if (swift::VarDecl *var_decl = llvm::dyn_cast<swift::VarDecl>(decl)) {
         if (!var_decl->getName().str().startswith("$")) {
+          llvm::dbgs() << "Variable decl: " << var_decl->getName().str() << "\n";
           register_one_var(var_decl);
         }
       }
