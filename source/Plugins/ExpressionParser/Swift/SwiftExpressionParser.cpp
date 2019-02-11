@@ -1972,10 +1972,7 @@ unsigned SwiftExpressionParser::Parse(DiagnosticManager &diagnostic_manager,
           done_serialization = true;
         });
   } else {
-    sil_module->setSerializeSILAction([&sil_module] {
-      llvm::dbgs() << "After diag passes";
-      sil_module->print(llvm::dbgs(), true);
-    });
+    sil_module->setSerializeSILAction([] {});
   }
 
   runSILDiagnosticPasses(*sil_module);
